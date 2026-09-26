@@ -389,3 +389,428 @@ The contract maintains the following invariants at the end of every transaction:
 ---
 
 *Issues: [#386](https://github.com/soterika/aura-vault-protocol/issues/386)*
+
+---
+
+## 11. Edge Case Analysis
+
+This section provides a detailed analysis of five edge cases in the share calculation formula. Each case includes a numerical worked example and the corresponding Rust implementation using checked arithmetic.
+
+---
+
+### 11.1 First Depositor — 1:1 Seed Ratio (`total_shares = 0`)
+
+**Scenario:** The vault is freshly initialised. No deposits have been made. `total_shares == 0` and `total_assets == 0`.
+
+**Why this is an edge case:**  
+The general deposit formula `floor(amount × total_shares / total_assets)` would produce `0 / 0`, which is undefined. The code must special-case this to set a meaningful initial exchange rate.
+
+**Formula applied:**
+
+```
+new_shares = amount          // when total_shares == 0 OR total_assets == 0
+```
+
+**Numerical example:**
+
+Alice is the first depositor and deposits 5,000,000 stroops (0.5 USDC with 7-decimal precision):
+
+```
+Before:
+  total_assets  = 0
+  total_shares  = 0
+
+Deposit amount  = 5,000,000
+
+Since total_shares == 0 → seed ratio
+  new_shares    = 5,000,000
+
+After:
+  total_assets  = 5,000,000
+  total_shares  = 5,000,000
+  exchange rate = 5,000,000 / 5,000,000 = 1.000 token/share
+```
+
+**Rust implementation (from `lib.rs`):**
+
+```rust
+let (new_shares, new_total_deposited, new_total_shares) =
+    if total_shares == 0 || total_deposited == 0 {
+        // Seed ratio: first depositor gets shares equal to deposit amount
+        let new_total = total_deposited
+            .checked_add(amount)
+            .ok_or(VaultError::MathOverflow)?;
+        (amount, new_total, amount)
+    } else {
+        // General formula: floor(amount × total_shares / total_deposited)
+        let numerator = amount
+            .checked_mul(total_shares)
+            .ok_or(VaultError::MathOverflow)?;
+        let ns = numerator
+            .checked_div(total_deposited)
+            .ok_or(VaultError::MathOverflow)?;
+        if ns <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+        let new_total = total_deposited
+            .checked_add(amount)
+            .ok_or(VaultError::MathOverflow)?;
+        let new_ts = total_shares
+            .checked_add(ns)
+            .ok_or(VaultError::MathOverflow)?;
+        (ns, new_total, new_ts)
+    };
+```
+
+**Key invariant:** The 1:1 seed ratio sets the initial exchange rate at exactly 1.0. This makes reasoning about early-vault state straightforward. Any subsequent deposits use the general formula and will preserve proportional fairness.
+
+---
+
+### 11.2 Tiny Deposit That Rounds to 0 Shares — `ZeroAmount` Error
+
+**Scenario:** The vault has accrued significant yield, raising the exchange rate far above 1.0. A depositor submits a very small amount that, when run through the share formula, floors to zero.
+
+**Why this is an edge case:**  
+If `new_shares == 0` were allowed, the depositor would lose their tokens to the vault with no shares to show for it. Their deposit would silently inflate the value of existing shareholders — equivalent to a gift. The contract rejects this.
+
+**Formula:**
+
+```
+new_shares = floor(amount × total_shares / total_assets)
+           = floor(1 × 10,000,000 / 50,000,000)
+           = floor(0.2)
+           = 0  → REJECTED with VaultError::ZeroAmount
+```
+
+**Numerical example:**
+
+State: exchange rate has grown to 5.0 tokens per share (total_assets = 50,000,000, total_shares = 10,000,000).
+
+```
+total_assets  = 50,000,000  (5 USDC)
+total_shares  = 10,000,000
+exchange rate = 50,000,000 / 10,000,000 = 5.0 tokens/share
+
+Depositor attempts: amount = 3 stroops
+
+new_shares = floor(3 × 10,000,000 / 50,000,000)
+           = floor(30,000,000 / 50,000,000)
+           = floor(0.6)
+           = 0
+
+→ VaultError::ZeroAmount returned. Deposit rejected.
+```
+
+**Minimum safe deposit at this exchange rate:**
+
+```
+Minimum amount to receive 1 share:
+  1 = floor(amount × 10,000,000 / 50,000,000)
+  amount ≥ ceil(50,000,000 / 10,000,000) = 5 stroops
+
+So deposit of 5 stroops → new_shares = floor(5 × 10,000,000 / 50,000,000) = floor(1.0) = 1 ✓
+```
+
+**Rust implementation (from `lib.rs`):**
+
+```rust
+let numerator = amount
+    .checked_mul(total_shares)
+    .ok_or(VaultError::MathOverflow)?;
+let new_shares = numerator
+    .checked_div(total_deposited)
+    .ok_or(VaultError::MathOverflow)?;
+
+if new_shares <= 0 {
+    return Err(VaultError::ZeroAmount);
+}
+```
+
+**Practical implication:** As the vault accumulates yield and the exchange rate rises, the minimum economically meaningful deposit increases proportionally. This is the expected behaviour for a yield-bearing vault — dust deposits become unviable as the share price grows.
+
+---
+
+### 11.3 Very Large Deposit Approaching `i128::MAX` — Overflow Check
+
+**Scenario:** A whale attempts to deposit an amount that, when multiplied by `total_shares`, exceeds `i128::MAX`. The intermediate product overflows even before the division can occur.
+
+**`i128::MAX` value:**
+
+```
+i128::MAX = 170,141,183,460,469,231,731,687,303,715,884,105,727
+          ≈ 1.70 × 10^38
+```
+
+**Numerical example — triggering overflow:**
+
+Suppose total_shares = 10^18 (a large but realistic number after many deposits and years of 7-decimal precision).
+
+```
+total_shares  = 1,000,000,000,000,000,000  (10^18)
+total_assets  = 1,000,000,000,000,000,000  (10^18, exchange rate = 1.0)
+
+Deposit attempt: amount = 2 × 10^20
+
+Intermediate: amount × total_shares
+  = 2 × 10^20 × 10^18
+  = 2 × 10^38
+  > i128::MAX (≈ 1.70 × 10^38)
+
+→ checked_mul returns None
+→ VaultError::MathOverflow returned
+```
+
+**Numerical example — safe large deposit:**
+
+Using the same state, a deposit of `10^19` is safe:
+
+```
+amount = 10,000,000,000,000,000,000  (10^19)
+
+Intermediate: 10^19 × 10^18 = 10^37 < i128::MAX ✓
+
+new_shares = floor(10^37 / 10^18) = 10^19
+
+After deposit:
+  total_assets  = 2 × 10^19
+  total_shares  = 2 × 10^19
+  exchange rate = 1.0 (unchanged, deposit at current rate)
+```
+
+**Rust implementation (overflow-safe):**
+
+```rust
+// Cargo.toml profile: overflow-checks = true ensures debug AND release
+// catch integer overflow with a panic in tests, but the contract code
+// uses checked_* explicitly so it returns an Err rather than panicking.
+
+let numerator: i128 = amount
+    .checked_mul(total_shares)
+    .ok_or(VaultError::MathOverflow)?;  // Returns Err if product > i128::MAX
+
+let new_shares: i128 = numerator
+    .checked_div(total_deposited)
+    .ok_or(VaultError::MathOverflow)?;  // Returns Err on division by zero
+```
+
+**Cargo.toml release profile setting:**
+
+```toml
+[profile.release]
+overflow-checks = true   # Soroban requirement; panics are caught by the runtime
+```
+
+**Safe operating range:** With 7-decimal precision (stroops), `i128::MAX / 10^7 ≈ 1.7 × 10^31` tokens. The vault can safely handle deposits up to roughly `10^15` tokens even if `total_shares` has grown to `10^15`. Real-world TVL of even $10 billion (10^16 micro-USDC stroops) leaves ample headroom.
+
+---
+
+### 11.4 Share Price After Many Small Harvests — Precision Drift
+
+**Scenario:** Many small yield harvests accumulate. Each harvest is small enough that the integer ratio `total_assets / total_shares` increases by only a fraction of a stroop, never completing a full integer step. Over thousands of iterations, the share price grows correctly, but the per-harvest rounding means no individual harvest may visibly move the ratio.
+
+**Why this is an edge case:**  
+Integer arithmetic means the "observable" share price (expressed as an integer) lags slightly behind the true fractional price. After N harvests of yield `y` each, the true price should be `(total_assets + N×y×(1-fee)) / total_shares`. Due to truncation in the integer ratio, the observable price may be slightly lower.
+
+**Numerical example — 1,000 micro-harvests:**
+
+```
+Initial state:
+  total_assets  = 1,000,000,000  (1,000 USDC in stroops)
+  total_shares  = 1,000,000,000
+  exchange rate = 1.0000000 tokens/share
+
+Each harvest injects yield_amount = 100 stroops (0.00001 USDC)
+Performance fee: 10% → yield_net = 90 stroops per harvest
+
+After 1 harvest:
+  total_assets = 1,000,000,090
+  exchange rate = 1,000,000,090 / 1,000,000,000 = 1.000000090 tokens/share
+  (observable integer: floor(1,000,000,090 / 1,000,000,000) = 1 — no visible change in integer ratio)
+
+After 100 harvests (cumulative yield_net = 9,000 stroops):
+  total_assets = 1,000,009,000
+  exchange rate = 1,000,009,000 / 1,000,000,000 ≈ 1.000009 tokens/share
+  (still rounds to 1 in integer price)
+
+After 1,000 harvests (cumulative yield_net = 90,000 stroops):
+  total_assets = 1,000,090,000
+  exchange rate = 1,000,090,000 / 1,000,000,000 ≈ 1.0000900 tokens/share
+  (observable price = 1; fractional accumulation visible only on withdraw)
+
+Redemption value of 1,000,000,000 shares:
+  floor(1,000,000,000 × 1,000,090,000 / 1,000,000,000)
+= floor(1,000,090,000)
+= 1,000,090,000 stroops  ← correct; the yield DID accrue, just not as integer price change
+```
+
+**Key insight:** Precision drift manifests as a gap between the *displayed* integer price-per-share and the actual redeemable value. The yield is faithfully tracked in `total_assets` — it is only the human-readable "price per share" metric that appears to lag. On withdrawal, the full accrued value is correctly redeemed via `floor(shares × total_assets / total_shares)`.
+
+**Rust example — tracking accumulated yield correctly:**
+
+```rust
+// The observable price_per_share helper (used in analytics, not in share math):
+fn price_per_share(total_assets: i128, total_shares: i128) -> i128 {
+    if total_shares == 0 {
+        return 0;
+    }
+    // Multiply by 10^7 for 7 decimal places of precision in the display value
+    total_assets
+        .checked_mul(10_000_000)
+        .and_then(|n| n.checked_div(total_shares))
+        .unwrap_or(0)
+}
+
+// At 1,000 harvests of 90 stroops each:
+// price_per_share(1_000_090_000, 1_000_000_000)
+// = floor(1_000_090_000 × 10_000_000 / 1_000_000_000)
+// = floor(10_000_900_000_000 / 1_000_000_000)
+// = 10_000_900  (represents 1.0000900 tokens/share)
+```
+
+**Mitigation:** For display purposes, always scale the ratio by at least `10^7` (one full stroop precision factor) to expose sub-stroop price movement. The `price_per_share` helper above achieves this. The share math itself remains correct regardless.
+
+---
+
+### 11.5 Withdraw When `total_assets` Slightly Mismatches Due to Rounding
+
+**Scenario:** After a sequence of deposits and partial withdrawals, the sum of all individual redemption values may be slightly less than `total_assets` (due to accumulated floor rounding). When the last depositor withdraws, they may receive a slightly larger redemption than expected — the accumulated rounding dust flows to them.
+
+**Why this is an edge case:**  
+The vault guarantees solvency (`total_assets ≥ sum of all redeemable values`) but not exact atomisation. The last withdrawer mops up any rounding buffer.
+
+**Numerical example — rounding dust accumulation:**
+
+```
+Three depositors, each holds 333 shares out of 999 total.
+total_assets = 1,000 tokens (exchange rate slightly > 1.0)
+
+Each depositor redeems 333 shares:
+  redeem_1 = floor(333 × 1,000 / 999) = floor(333,000 / 999) = floor(333.333...) = 333
+  redeem_2 = floor(333 × 667 / 666)                    -- state after first withdrawal
+           = floor(333 × 667 / 666)
+
+Let's track state transitions:
+
+Step 1 — Depositor A withdraws 333 shares:
+  redeem_A = floor(333 × 1,000 / 999) = 333
+  total_assets → 1,000 - 333 = 667
+  total_shares → 999 - 333 = 666
+
+Step 2 — Depositor B withdraws 333 shares:
+  redeem_B = floor(333 × 667 / 666) = floor(222,111 / 666) = floor(333.500...) = 333
+  total_assets → 667 - 333 = 334
+  total_shares → 666 - 333 = 333
+
+Step 3 — Depositor C withdraws last 333 shares:
+  redeem_C = floor(333 × 334 / 333) = floor(111,222 / 333) = floor(334.0) = 334
+  total_assets → 334 - 334 = 0
+  total_shares → 333 - 333 = 0
+
+Summary:
+  A deposited 333 tokens (via proportional claim), redeemed 333 (± dust)
+  B deposited 333 tokens, redeemed 333
+  C deposited 334 tokens (via proportional claim), redeemed 334
+
+Total redeemed = 333 + 333 + 334 = 1,000 ✓  (equals total_assets, rounding dust collected by last withdrawer)
+```
+
+**The key observation:** Depositor C receives 334 rather than 333. The single extra token is the rounding dust from depositors A and B. This is the expected and correct behaviour — the vault is always fully solvent and always distributes exactly `total_assets` in total.
+
+**Rust implementation (from `lib.rs`):**
+
+```rust
+// Withdraw: burn shares, compute redemption with floor division
+let numerator = shares
+    .checked_mul(total_deposited)
+    .ok_or(VaultError::MathOverflow)?;
+let redeem_amount = numerator
+    .checked_div(total_shares)
+    .ok_or(VaultError::MathOverflow)?;
+
+// CEI: update state before transfer
+let new_balance = caller_balance
+    .checked_sub(shares)
+    .ok_or(VaultError::InsufficientShares)?;
+let new_total_shares = total_shares
+    .checked_sub(shares)
+    .ok_or(VaultError::MathOverflow)?;
+let new_total_deposited = total_deposited
+    .checked_sub(redeem_amount)
+    .ok_or(VaultError::InsufficientUnderlying)?;
+
+set_balance(&env, &caller, new_balance);
+set_total_shares(&env, new_total_shares);
+set_total_deposited(&env, new_total_deposited);
+
+// Then transfer — safe because state already updated (CEI)
+token.transfer(&env.current_contract_address(), &caller, &redeem_amount);
+```
+
+**Invariant maintained:** `total_assets` is decremented by exactly `redeem_amount` (the floored value). If `total_assets` was already slightly larger than the sum of all individually-floored redemptions, the last withdrawer absorbs that difference. This is the correct behaviour and is consistent with ERC-4626.
+
+---
+
+## 12. ERC-4626 Comparison
+
+ERC-4626 is the Ethereum standard for tokenised yield vaults. Aura Vault shares the same mathematical foundations but diverges in implementation details suited to the Soroban/Stellar environment.
+
+### Formula Equivalence
+
+| Operation | ERC-4626 | Aura Vault |
+|---|---|---|
+| **Deposit shares** | `floor(assets × totalSupply / totalAssets)` | `floor(amount × total_shares / total_deposited)` |
+| **Withdraw assets** | `floor(shares × totalAssets / totalSupply)` | `floor(shares × total_assets / total_shares)` |
+| **First deposit** | Virtual shares/assets offset | 1:1 seed ratio |
+| **Rounding direction** | Assets round down (deposit favours vault) | Floor on both sides (favours vault) |
+| **Integer type** | `uint256` (EVM 256-bit unsigned) | `i128` (Soroban 128-bit signed) |
+
+### Inflation Attack Prevention
+
+| Mechanism | ERC-4626 | Aura Vault |
+|---|---|---|
+| **Primary defence** | Virtual shares/assets (`_decimalsOffset`) | Flash loan guard (`BalanceMismatch` error) |
+| **Secondary defence** | `previewDeposit` reverts if shares == 0 | Zero-share rejection (`ZeroAmount` error) |
+| **Approach** | Add virtual 1 share + 1 asset to denominator | Check actual on-chain balance matches tracked state |
+
+ERC-4626's virtual offset approach adds `10^decimalsOffset` to both `totalSupply` and `totalAssets` in every preview calculation, making the initial exchange rate effectively `1 / 10^offset` instead of `∞`. Aura Vault achieves the same result by verifying the on-chain balance is never manipulated between calls.
+
+### Rounding Direction
+
+Both ERC-4626 and Aura Vault round in favour of the vault (floor) on both deposit and withdrawal. This is the only rounding direction that maintains solvency — rounding up on either side could allow incremental value extraction from the vault.
+
+ERC-4626 specifies this formally:
+> "MUST round down towards 0. This does not include any fees that are charged against assets in the Vault."
+
+Aura Vault follows the same convention via Rust's integer division truncation.
+
+### Overflow Safety
+
+| Aspect | ERC-4626 / EVM | Aura Vault / Soroban |
+|---|---|---|
+| **Integer width** | `uint256` (340 undecillion max) | `i128` (170 undecillion max) |
+| **Overflow behaviour** | Reverts via Solidity's built-in overflow check (0.8+) | `checked_mul`/`checked_div` returning `VaultError::MathOverflow` |
+| **Risk level** | Very low for practical token amounts | Low; safe operating range ≈ 10^19 tokens at 7-decimal precision |
+
+The smaller `i128` type means Aura Vault must be more careful about intermediate products. The `checked_mul` guard before every division catches any overflow before it can corrupt state.
+
+### Preview Functions
+
+ERC-4626 mandates `previewDeposit`, `previewWithdraw`, `previewMint`, and `previewRedeem` — read-only functions that simulate the outcome of a vault operation including fees.
+
+Aura Vault's equivalent is the `balance_of` + `total_assets` view functions, which together allow off-chain callers to compute the same estimates. A formal `preview_deposit` / `preview_withdraw` interface is tracked in the roadmap.
+
+### Key Differences Summary
+
+| Feature | ERC-4626 | Aura Vault |
+|---|---|---|
+| **Platform** | Ethereum (EVM) | Stellar (Soroban/WASM) |
+| **Token standard** | ERC-20 | SEP-41 |
+| **Share token** | ERC-20 (transferable) | Internal ledger (`balance(addr)`) |
+| **Fee handling** | Implementation-defined | 10% performance fee on harvest |
+| **Governance** | Implementation-defined | 3-of-5 multi-sig timelock |
+| **Emergency stop** | Implementation-defined | `pause()` / `unpause()` |
+| **Audit trail** | On-chain events | On-chain events + off-chain `contract_events` table |
+
+---
+
+*Edge cases added in: [#974](https://github.com/soterika/aura-vault-protocol/issues/974)*
